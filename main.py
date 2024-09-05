@@ -160,7 +160,7 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
     and "gemini" not in provider['model'][request.model]:
         engine = "openrouter"
 
-    if endpoint == "/v1/images/generations":
+    if endpoint == "/hfv1/images/generations":
         engine = "dalle"
         request.stream = False
 
@@ -313,15 +313,15 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
                 raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
-@app.post("/v1/chat/completions")
+@app.post("/hfv1/chat/completions")
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
 
-@app.options("/v1/chat/completions")
+@app.options("/hfv1/chat/completions")
 async def options_handler():
     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
-@app.get("/v1/models")
+@app.get("/hfv1/models")
 async def list_models(token: str = Depends(verify_api_key)):
     models = post_all_models(token, app.state.config, app.state.api_list)
     return JSONResponse(content={
@@ -329,12 +329,12 @@ async def list_models(token: str = Depends(verify_api_key)):
         "data": models
     })
 
-@app.post("/v1/images/generations")
+@app.post("/hfv1/images/generations")
 async def images_generations(
     request: ImageGenerationRequest,
     token: str = Depends(verify_api_key)
 ):
-    return await model_handler.request_model(request, token, endpoint="/v1/images/generations")
+    return await model_handler.request_model(request, token, endpoint="/hfv1/images/generations")
 
 @app.get("/generate-api-key")
 def generate_api_key():
@@ -364,7 +364,7 @@ if __name__ == '__main__':
     uvicorn.run(
         "__main__:app",
         host="0.0.0.0",
-        port=8000,
+        port=7860,
         reload=True,
         ws="none",
         # log_level="warning"
