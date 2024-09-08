@@ -1,7 +1,9 @@
 from log_config import logger
 
+import re
 import httpx
 import secrets
+import time as time_module
 from contextlib import asynccontextmanager
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,8 +14,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from models import RequestModel, ImageGenerationRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
-from utils import error_handling_wrapper, post_all_models, load_config
+from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
 
+from collections import defaultdict
 from typing import List, Dict, Union
 from urllib.parse import urlparse
 
@@ -124,7 +127,9 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 percentages[channel] = success_count / total_count * 100
             else:
                 percentages[channel] = 0
-        return percentages
+
+        sorted_percentages = dict(sorted(percentages.items(), key=lambda item: item[1], reverse=True))
+        return sorted_percentages
 
     def calculate_failure_percentages(self):
         percentages = {}
@@ -134,7 +139,9 @@ class StatsMiddleware(BaseHTTPMiddleware):
                 percentages[channel] = failure_count / total_count * 100
             else:
                 percentages[channel] = 0
-        return percentages
+
+        sorted_percentages = dict(sorted(percentages.items(), key=lambda item: item[1], reverse=True))
+        return sorted_percentages
 
     async def cleanup_old_data(self):
         cutoff_time = datetime.now() - timedelta(hours=24)
@@ -200,6 +207,8 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
     url, headers, payload = await get_payload(request, engine, provider)
 
+    # logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
+    # logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
     try:
         if request.stream:
             model = provider['model'][request.model]
@@ -215,13 +224,34 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
         return response
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
-        logger.error(f"Error with provider {provider['provider']}: {str(e)}")
-
         # 更新失败计数
         async with app.middleware_stack.app.lock:
             app.middleware_stack.app.channel_failure_counts[provider['provider']] += 1
 
         raise e
+
+def weighted_round_robin(weights):
+    provider_names = list(weights.keys())
+    current_weights = {name: 0 for name in provider_names}
+    num_selections = total_weight = sum(weights.values())
+    weighted_provider_list = []
+
+    for _ in range(num_selections):
+        max_ratio = -1
+        selected_letter = None
+
+        for name in provider_names:
+            current_weights[name] += weights[name]
+            ratio = current_weights[name] / weights[name]
+
+            if ratio > max_ratio:
+                max_ratio = ratio
+                selected_letter = name
+
+        weighted_provider_list.append(selected_letter)
+        current_weights[selected_letter] -= total_weight
+
+    return weighted_provider_list
 
 import asyncio
 class ModelRequestHandler:
@@ -232,8 +262,9 @@ class ModelRequestHandler:
         config = app.state.config
         # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
-
         api_index = api_list.index(token)
+        if not safe_get(config, 'api_keys', api_index, 'model'):
+            raise HTTPException(status_code=404, detail="No matching model found")
         provider_rules = []
 
         for model in config['api_keys'][api_index]['model']:
@@ -296,13 +327,31 @@ class ModelRequestHandler:
 
         # 检查是否启用轮询
         api_index = api_list.index(token)
+        weights = safe_get(config, 'api_keys', api_index, "weights")
+        if weights:
+            # 步骤 1: 提取 matching_providers 中的所有 provider 值
+            providers = set(provider['provider'] for provider in matching_providers)
+            weight_keys = set(weights.keys())
+
+            # 步骤 3: 计算交集
+            intersection = providers.intersection(weight_keys)
+            weights = dict(filter(lambda item: item[0] in intersection, weights.items()))
+            weighted_provider_name_list = weighted_round_robin(weights)
+            new_matching_providers = []
+            for provider_name in weighted_provider_name_list:
+                for provider in matching_providers:
+                    if provider['provider'] == provider_name:
+                        new_matching_providers.append(provider)
+            matching_providers = new_matching_providers
+
+        # import json
+        # print("matching_providers", json.dumps(matching_providers, indent=4, ensure_ascii=False, default=circular_list_encoder))
         use_round_robin = True
         auto_retry = True
-        if config['api_keys'][api_index].get("preferences"):
-            if config['api_keys'][api_index]["preferences"].get("USE_ROUND_ROBIN") == False:
-                use_round_robin = False
-            if config['api_keys'][api_index]["preferences"].get("AUTO_RETRY") == False:
-                auto_retry = False
+        if safe_get(config, 'api_keys', api_index, "preferences", "USE_ROUND_ROBIN") == False:
+            use_round_robin = False
+        if safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY") == False:
+            auto_retry = False
 
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint)
 
@@ -327,8 +376,73 @@ class ModelRequestHandler:
 
 model_handler = ModelRequestHandler()
 
-# 安全性依赖
+def parse_rate_limit(limit_string):
+    # 定义时间单位到秒的映射
+    time_units = {
+        's': 1, 'sec': 1, 'second': 1,
+        'm': 60, 'min': 60, 'minute': 60,
+        'h': 3600, 'hr': 3600, 'hour': 3600,
+        'd': 86400, 'day': 86400,
+        'mo': 2592000, 'month': 2592000,
+        'y': 31536000, 'year': 31536000
+    }
+
+    # 使用正则表达式匹配数字和单位
+    match = re.match(r'^(\d+)/(\w+)$', limit_string)
+    if not match:
+        raise ValueError(f"Invalid rate limit format: {limit_string}")
+
+    count, unit = match.groups()
+    count = int(count)
+
+    # 转换单位到秒
+    if unit not in time_units:
+        raise ValueError(f"Unknown time unit: {unit}")
+
+    seconds = time_units[unit]
+
+    return (count, seconds)
+
+class InMemoryRateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+
+    async def is_rate_limited(self, key: str, limit: int, period: int) -> bool:
+        now = time_module.time()
+        self.requests[key] = [req for req in self.requests[key] if req > now - period]
+        if len(self.requests[key]) >= limit:
+            return True
+        self.requests[key].append(now)
+        return False
+
+rate_limiter = InMemoryRateLimiter()
+
+async def get_user_rate_limit(token: str = None):
+    # 这里应该实现根据 token 获取用户速率限制的逻辑
+    # 示例： 返回 (次数， 秒数)
+    config = app.state.config
+    api_list = app.state.api_list
+    api_index = api_list.index(token)
+    raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "RATE_LIMIT")
+
+    if not token or not raw_rate_limit:
+        return (60, 60)
+
+    rate_limit = parse_rate_limit(raw_rate_limit)
+    return rate_limit
+
 security = HTTPBearer()
+async def rate_limit_dependency(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials if credentials else None
+    # print("token", token)
+    limit, period = await get_user_rate_limit(token)
+
+    # 使用 IP 地址和 token（如果有）作为限制键
+    client_ip = request.client.host
+    rate_limit_key = f"{client_ip}:{token}" if token else client_ip
+
+    if await rate_limiter.is_rate_limited(rate_limit_key, limit, period):
+        raise HTTPException(status_code=429, detail="Too many requests")
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     api_list = app.state.api_list
@@ -348,15 +462,15 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
                 raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
-@app.post("/uni/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
     return await model_handler.request_model(request, token)
 
-@app.options("/uni/v1/chat/completions")
+@app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def options_handler():
     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
-@app.get("/uni/v1/models")
+@app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
 async def list_models(token: str = Depends(verify_api_key)):
     models = post_all_models(token, app.state.config, app.state.api_list)
     return JSONResponse(content={
@@ -364,20 +478,20 @@ async def list_models(token: str = Depends(verify_api_key)):
         "data": models
     })
 
-@app.post("/uni/v1/images/generations")
+@app.post("/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
 async def images_generations(
     request: ImageGenerationRequest,
     token: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, token, endpoint="/uni/v1/images/generations")
 
-@app.get("/generate-api-key")
+@app.get("/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
 def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(36)
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(rate_limit_dependency)])
 async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)):
     middleware = app.middleware_stack.app
     if isinstance(middleware, StatsMiddleware):

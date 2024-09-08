@@ -32,7 +32,7 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     # 构建SSE响应
-    sse_response = f"data: {json_data}\n\r"
+    sse_response = f"data: {json_data}\n\r\n"
 
     return sse_response
 
@@ -90,7 +90,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
             function_full_response = json.dumps(function_call["functionCall"]["args"])
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response)
             yield sse_string
-        yield "data: [DONE]\n\r"
+        yield "data: [DONE]\n\r\n"
 
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
@@ -137,51 +137,23 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             function_full_response = json.dumps(function_call["input"])
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
             yield sse_string
-        yield "data: [DONE]\n\r"
+        yield "data: [DONE]\n\r\n"
 
 async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
-    redirect_count = 0
-    while redirect_count < max_redirects:
-        # logger.info(f"fetch_gpt_response_stream: {url}")
-        async with client.stream('POST', url, headers=headers, json=payload) as response:
-            error_message = await check_response(response, "fetch_gpt_response_stream")
-            if error_message:
-                yield error_message
-                return
-
-            buffer = ""
-            try:
-                async for chunk in response.aiter_text():
-                    # logger.info(f"chunk: {repr(chunk)}")
-                    buffer += chunk
-                    if chunk.startswith("<script"):
-                        import re
-                        redirect_match = re.search(r"window\.location\.href\s*=\s*'([^']+)'", chunk)
-                        if redirect_match:
-                            new_url = redirect_match.group(1)
-                            # logger.info(f"new_url: {new_url}")
-                            if not new_url.startswith('http'):
-                                # 如果是相对路径，构造完整URL
-                                # logger.info(url.split('/'))
-                                base_url = '/'.join(url.split('/')[:3])
-                                new_url = base_url + new_url
-                            url = new_url
-                            # logger.info(f"new_url: {new_url}")
-                            redirect_count += 1
-                            break
-                    redirect_count = 0
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        # logger.info("line: %s", repr(line))
-                        if line and line != "data: " and line != "data:" and not line.startswith(": "):
-                            yield line + "\n\r"
-            except httpx.RemoteProtocolError as e:
-                yield {"error": f"fetch_gpt_response_stream RemoteProtocolError {e.__class__.__name__}", "details": str(e)}
-                return
-        if redirect_count == 0:
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        error_message = await check_response(response, "fetch_gpt_response_stream")
+        if error_message:
+            yield error_message
             return
 
-    yield {"error": "Too many redirects", "details": f"Reached maximum of {max_redirects} redirects"}
+        buffer = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                # logger.info("line: %s", repr(line))
+                if line and line != "data: " and line != "data:" and not line.startswith(": "):
+                    yield line.strip() + "\n\r\n"
 
 async def fetch_claude_response_stream(client, url, headers, payload, model):
     timestamp = datetime.timestamp(datetime.now())
@@ -236,7 +208,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                         function_call_content = delta["partial_json"]
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
                         yield sse_string
-        yield "data: [DONE]\n\r"
+        yield "data: [DONE]\n\r\n"
 
 async def fetch_response(client, url, headers, payload):
     response = await client.post(url, headers=headers, json=payload)
