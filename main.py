@@ -515,16 +515,16 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
                 raise HTTPException(status_code=403, detail="Permission denied")
     return token
 
-@app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/uni/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
     # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
-@app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
+@app.options("/uni/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def options_handler():
     return JSONResponse(status_code=200, content={"detail": "OPTIONS allowed"})
 
-@app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
+@app.get("/uni/v1/models", dependencies=[Depends(rate_limit_dependency)])
 async def list_models(token: str = Depends(verify_api_key)):
     models = post_all_models(token, app.state.config, app.state.api_list)
     return JSONResponse(content={
@@ -532,14 +532,14 @@ async def list_models(token: str = Depends(verify_api_key)):
         "data": models
     })
 
-@app.post("/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/uni/v1/images/generations", dependencies=[Depends(rate_limit_dependency)])
 async def images_generations(
     request: ImageGenerationRequest,
     token: str = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, token, endpoint="/uni/v1/images/generations")
 
-@app.get("/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
+@app.get("/uni/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
 def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(36)
     return JSONResponse(content={"api_key": api_key})
