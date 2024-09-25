@@ -1,8 +1,56 @@
+import os
+import re
 import json
+import httpx
+import base64
+import urllib.parse
+
 from models import RequestModel
 from utils import c35s, c3s, c3o, c3h, gem, BaseAPI
 
+def encode_image(image_path):
+  with open(image_path, "rb") as image_file:
+    return base64.b64encode(image_file.read()).decode('utf-8')
+
+async def get_doc_from_url(url):
+    filename = urllib.parse.unquote(url.split("/")[-1])
+    transport = httpx.AsyncHTTPTransport(
+        http2=True,
+        verify=False,
+        retries=1
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        try:
+            response = await client.get(
+                url,
+                timeout=30.0
+            )
+            with open(filename, 'wb') as f:
+                f.write(response.content)
+
+        except httpx.RequestError as e:
+            print(f"An error occurred while requesting {e.request.url!r}.")
+
+    return filename
+
+async def get_encode_image(image_url):
+    filename = await get_doc_from_url(image_url)
+    image_path = os.getcwd() + "/" + filename
+    base64_image = encode_image(image_path)
+    if filename.endswith(".png"):
+        prompt = f"data:image/png;base64,{base64_image}"
+    else:
+        prompt = f"data:image/jpeg;base64,{base64_image}"
+    os.remove(image_path)
+    return prompt
+
 async def get_image_message(base64_image, engine = None):
+    if base64_image.startswith("http"):
+        base64_image = await get_encode_image(base64_image)
+    colon_index = base64_image.index(":")
+    semicolon_index = base64_image.index(";")
+    image_type = base64_image[colon_index + 1:semicolon_index]
+
     if "gpt" == engine:
         return {
             "type": "image_url",
@@ -15,24 +63,28 @@ async def get_image_message(base64_image, engine = None):
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": "image/jpeg",
+                "media_type": image_type,
                 "data": base64_image.split(",")[1],
             }
         }
     if "gemini" == engine or "vertex-gemini" == engine:
         return {
             "inlineData": {
-                "mimeType": "image/jpeg",
+                "mimeType": image_type,
                 "data": base64_image.split(",")[1],
             }
         }
     raise ValueError("Unknown engine")
 
 async def get_text_message(role, message, engine = None):
-    if "gpt" == engine or "claude" == engine or "openrouter" == engine or "vertex-claude" == engine:
+    if "gpt" == engine or "claude" == engine or "openrouter" == engine or "vertex-claude" == engine or "o1" == engine:
         return {"type": "text", "text": message}
     if "gemini" == engine or "vertex-gemini" == engine:
         return {"text": message}
+    if engine == "cloudflare":
+        return message
+    if engine == "cohere":
+        return message
     raise ValueError("Unknown engine")
 
 async def get_gemini_payload(request, engine, provider):
@@ -102,6 +154,7 @@ async def get_gemini_payload(request, engine, provider):
         elif msg.role != "system":
             messages.append({"role": msg.role, "parts": content})
         elif msg.role == "system":
+            content[0]["text"] = re.sub(r"_+", "_", content[0]["text"])
             systemInstruction = {"parts": content}
 
 
@@ -165,8 +218,6 @@ async def get_gemini_payload(request, engine, provider):
     return url, headers, payload
 
 import time
-import httpx
-import base64
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -419,6 +470,18 @@ async def get_vertex_claude_payload(request, engine, provider):
                 "tool_use_id": tool_id,
                 "content": content
             }]})
+        elif msg.role == "function":
+            messages.append({"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "name": msg.name,
+                "input": {"prompt": "..."}
+            }]})
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "content": msg.content
+            }]})
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
@@ -628,6 +691,178 @@ async def get_openrouter_payload(request, engine, provider):
 
     return url, headers, payload
 
+async def get_cohere_payload(request, engine, provider):
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
+
+    url = provider['base_url']
+
+    role_map = {
+        "user": "USER",
+        "assistant" : "CHATBOT",
+        "system": "SYSTEM"
+    }
+
+    messages = []
+    for msg in request.messages:
+        if isinstance(msg.content, list):
+            content = []
+            for item in msg.content:
+                if item.type == "text":
+                    text_message = await get_text_message(msg.role, item.text, engine)
+                    content.append(text_message)
+        else:
+            content = msg.content
+
+        if isinstance(content, list):
+            for item in content:
+                if item["type"] == "text":
+                    messages.append({"role": role_map[msg.role], "message": item["text"]})
+        else:
+            messages.append({"role": role_map[msg.role], "message": content})
+
+    model = provider['model'][request.model]
+    chat_history = messages[:-1]
+    query = messages[-1].get("message")
+    payload = {
+        "model": model,
+        "message": query,
+    }
+
+    if chat_history:
+        payload["chat_history"] = chat_history
+
+    miss_fields = [
+        'model',
+        'messages',
+        'tools',
+        'tool_choice',
+        'temperature',
+        'top_p',
+        'max_tokens',
+        'presence_penalty',
+        'frequency_penalty',
+        'n',
+        'user',
+        'include_usage',
+        'logprobs',
+        'top_logprobs'
+    ]
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            payload[field] = value
+
+    return url, headers, payload
+
+async def get_cloudflare_payload(request, engine, provider):
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
+
+    model = provider['model'][request.model]
+    url = "https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/{cf_model_id}".format(cf_account_id=provider['cf_account_id'], cf_model_id=model)
+
+    msg = request.messages[-1]
+    messages = []
+    content = None
+    if isinstance(msg.content, list):
+        for item in msg.content:
+            if item.type == "text":
+                content = await get_text_message(msg.role, item.text, engine)
+    else:
+        content = msg.content
+        name = msg.name
+
+    model = provider['model'][request.model]
+    payload = {
+        "prompt": content,
+    }
+
+    miss_fields = [
+        'model',
+        'messages',
+        'tools',
+        'tool_choice',
+        'temperature',
+        'top_p',
+        'max_tokens',
+        'presence_penalty',
+        'frequency_penalty',
+        'n',
+        'user',
+        'include_usage',
+        'logprobs',
+        'top_logprobs'
+    ]
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            payload[field] = value
+
+    return url, headers, payload
+
+async def get_o1_payload(request, engine, provider):
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    if provider.get("api"):
+        headers['Authorization'] = f"Bearer {provider['api'].next()}"
+
+    url = provider['base_url']
+
+    messages = []
+    for msg in request.messages:
+        if isinstance(msg.content, list):
+            content = []
+            for item in msg.content:
+                if item.type == "text":
+                    text_message = await get_text_message(msg.role, item.text, engine)
+                    content.append(text_message)
+        else:
+            content = msg.content
+
+        if isinstance(content, list) and msg.role != "system":
+            for item in content:
+                if item["type"] == "text":
+                    messages.append({"role": msg.role, "content": item["text"]})
+        elif msg.role != "system":
+            messages.append({"role": msg.role, "content": content})
+
+    model = provider['model'][request.model]
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+
+    miss_fields = [
+        'model',
+        'messages',
+        'tools',
+        'tool_choice',
+        'temperature',
+        'top_p',
+        'max_tokens',
+        'presence_penalty',
+        'frequency_penalty',
+        'n',
+        'user',
+        'include_usage',
+        'logprobs',
+        'top_logprobs'
+    ]
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            payload[field] = value
+
+    return url, headers, payload
+
 async def gpt2claude_tools_json(json_dict):
     import copy
     json_dict = copy.deepcopy(json_dict)
@@ -693,6 +928,18 @@ async def get_claude_payload(request, engine, provider):
                 "type": "tool_result",
                 "tool_use_id": tool_id,
                 "content": content
+            }]})
+        elif msg.role == "function":
+            messages.append({"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "name": msg.name,
+                "input": {"prompt": "..."}
+            }]})
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_017r5miPMV6PGSNKmhvHPic4",
+                "content": msg.content
             }]})
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
@@ -806,6 +1053,12 @@ async def get_payload(request: RequestModel, engine, provider):
         return await get_gpt_payload(request, engine, provider)
     elif engine == "openrouter":
         return await get_openrouter_payload(request, engine, provider)
+    elif engine == "cloudflare":
+        return await get_cloudflare_payload(request, engine, provider)
+    elif engine == "o1":
+        return await get_o1_payload(request, engine, provider)
+    elif engine == "cohere":
+        return await get_cohere_payload(request, engine, provider)
     elif engine == "dalle":
         return await get_dalle_payload(request, engine, provider)
     else:

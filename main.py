@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.exceptions import RequestValidationError
 
 from models import RequestModel, ImageGenerationRequest
 from request import get_payload
@@ -20,11 +21,19 @@ from collections import defaultdict
 from typing import List, Dict, Union
 from urllib.parse import urlparse
 
+import os
+is_debug = bool(os.getenv("DEBUG", False))
+
+async def create_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
-    import os
-    TIMEOUT = float(os.getenv("TIMEOUT", 20))
+    await create_tables()
+
+    TIMEOUT = float(os.getenv("TIMEOUT", 100))
     timeout = httpx.Timeout(connect=15.0, read=TIMEOUT, write=30.0, pool=30.0)
     default_headers = {
         "User-Agent": "curl/7.68.0",  # 模拟 curl 的 User-Agent
@@ -43,121 +52,125 @@ async def lifespan(app: FastAPI):
     # 关闭时的代码
     await app.state.client.aclose()
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, debug=is_debug)
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code == 404:
+        logger.error(f"404 Error: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail},
+    )
 
 import asyncio
 from time import time
 from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
-from datetime import datetime
-from datetime import timedelta
 import json
-import aiofiles
+
+async def parse_request_body(request: Request):
+    if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
+        try:
+            return await request.json()
+        except json.JSONDecodeError:
+            return None
+    return None
+
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean
+from sqlalchemy.sql import func
+
+# 定义数据库模型
+Base = declarative_base()
+
+class RequestStat(Base):
+    __tablename__ = 'request_stats'
+    id = Column(Integer, primary_key=True)
+    endpoint = Column(String)
+    ip = Column(String)
+    token = Column(String)
+    total_time = Column(Float)
+    model = Column(String)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+class ChannelStat(Base):
+    __tablename__ = 'channel_stats'
+    id = Column(Integer, primary_key=True)
+    provider = Column(String)
+    model = Column(String)
+    api_key = Column(String)
+    success = Column(Boolean)
+    first_response_time = Column(Float)  # 新增: 记录首次响应时间
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+# 创建异步引擎和会话
+engine = create_async_engine('sqlite+aiosqlite:///stats.db', echo=is_debug)
+async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 class StatsMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, exclude_paths=None, save_interval=3600, filename="stats.json"):
+    def __init__(self, app):
         super().__init__(app)
-        self.request_counts = defaultdict(int)
-        self.request_times = defaultdict(float)
-        self.ip_counts = defaultdict(lambda: defaultdict(int))
-        self.request_arrivals = defaultdict(list)
-        self.channel_success_counts = defaultdict(int)
-        self.channel_failure_counts = defaultdict(int)
-        self.lock = asyncio.Lock()
-        self.exclude_paths = set(exclude_paths or [])
-        self.save_interval = save_interval
-        self.filename = filename
-        self.last_save_time = time()
-
-        # 启动定期保存和清理任务
-        asyncio.create_task(self.periodic_save_and_cleanup())
+        self.db = async_session()
 
     async def dispatch(self, request: Request, call_next):
-        arrival_time = datetime.now()
+        if request.headers.get("x-api-key"):
+            token = request.headers.get("x-api-key")
+        elif request.headers.get("Authorization"):
+            token = request.headers.get("Authorization").split(" ")[1]
+        else:
+            token = None
+
         start_time = time()
+
+        request.state.parsed_body = await parse_request_body(request)
+
+        model = "unknown"
+        if request.state.parsed_body:
+            try:
+                request_model = RequestModel(**request.state.parsed_body)
+                model = request_model.model
+            except RequestValidationError:
+                pass
+            except Exception as e:
+                logger.error(f"Error processing request: {str(e)}")
+
         response = await call_next(request)
         process_time = time() - start_time
 
         endpoint = f"{request.method} {request.url.path}"
         client_ip = request.client.host
 
-        if request.url.path not in self.exclude_paths:
-            async with self.lock:
-                self.request_counts[endpoint] += 1
-                self.request_times[endpoint] += process_time
-                self.ip_counts[endpoint][client_ip] += 1
-                self.request_arrivals[endpoint].append(arrival_time)
+        # 异步更新数据库
+        await self.update_stats(endpoint, process_time, client_ip, model, token)
 
         return response
 
-    async def periodic_save_and_cleanup(self):
-        while True:
-            await asyncio.sleep(self.save_interval)
-            await self.save_stats()
-            await self.cleanup_old_data()
+    async def update_stats(self, endpoint, process_time, client_ip, model, token):
+        async with self.db as session:
+            # 为每个请求创建一条新的记录
+            new_request_stat = RequestStat(
+                endpoint=endpoint,
+                ip=client_ip,
+                token=token,
+                total_time=process_time,
+                model=model
+            )
+            session.add(new_request_stat)
+            await session.commit()
 
-    async def save_stats(self):
-        current_time = time()
-        if current_time - self.last_save_time < self.save_interval:
-            return
-
-        async with self.lock:
-            stats = {
-                "request_counts": dict(self.request_counts),
-                "request_times": dict(self.request_times),
-                "ip_counts": {k: dict(v) for k, v in self.ip_counts.items()},
-                "request_arrivals": {k: [t.isoformat() for t in v] for k, v in self.request_arrivals.items()},
-                "channel_success_counts": dict(self.channel_success_counts),
-                "channel_failure_counts": dict(self.channel_failure_counts),
-                "channel_success_percentages": self.calculate_success_percentages(),
-                "channel_failure_percentages": self.calculate_failure_percentages()
-            }
-
-        filename = self.filename
-        async with aiofiles.open(filename, mode='w') as f:
-            await f.write(json.dumps(stats, indent=2))
-
-        self.last_save_time = current_time
-
-    def calculate_success_percentages(self):
-        percentages = {}
-        for channel, success_count in self.channel_success_counts.items():
-            total_count = success_count + self.channel_failure_counts[channel]
-            if total_count > 0:
-                percentages[channel] = success_count / total_count * 100
-            else:
-                percentages[channel] = 0
-
-        sorted_percentages = dict(sorted(percentages.items(), key=lambda item: item[1], reverse=True))
-        return sorted_percentages
-
-    def calculate_failure_percentages(self):
-        percentages = {}
-        for channel, failure_count in self.channel_failure_counts.items():
-            total_count = failure_count + self.channel_success_counts[channel]
-            if total_count > 0:
-                percentages[channel] = failure_count / total_count * 100
-            else:
-                percentages[channel] = 0
-
-        sorted_percentages = dict(sorted(percentages.items(), key=lambda item: item[1], reverse=True))
-        return sorted_percentages
-
-    async def cleanup_old_data(self):
-        cutoff_time = datetime.now() - timedelta(hours=24)
-        async with self.lock:
-            for endpoint in list(self.request_arrivals.keys()):
-                self.request_arrivals[endpoint] = [
-                    t for t in self.request_arrivals[endpoint] if t > cutoff_time
-                ]
-                if not self.request_arrivals[endpoint]:
-                    del self.request_arrivals[endpoint]
-                    self.request_counts.pop(endpoint, None)
-                    self.request_times.pop(endpoint, None)
-                    self.ip_counts.pop(endpoint, None)
-
-    async def cleanup(self):
-        await self.save_stats()
+    async def update_channel_stats(self, provider, model, api_key, success, first_response_time):
+        async with self.db as session:
+            channel_stat = ChannelStat(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                success=success,
+                first_response_time=first_response_time
+            )
+            session.add(channel_stat)
+            await session.commit()
 
 # 配置 CORS 中间件
 app.add_middleware(
@@ -168,27 +181,35 @@ app.add_middleware(
     allow_headers=["*"],  # 允许所有头部字段
 )
 
-app.add_middleware(StatsMiddleware, exclude_paths=["/stats", "/generate-api-key"])
+app.add_middleware(StatsMiddleware)
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest], provider: Dict, endpoint=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest], provider: Dict, endpoint=None, token=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
+    # print("parsed_url", parsed_url)
     engine = None
     if parsed_url.netloc == 'generativelanguage.googleapis.com':
         engine = "gemini"
     elif parsed_url.netloc == 'aiplatform.googleapis.com':
         engine = "vertex"
+    elif parsed_url.netloc == 'api.cloudflare.com':
+        engine = "cloudflare"
     elif parsed_url.netloc == 'api.anthropic.com' or parsed_url.path.endswith("v1/messages"):
         engine = "claude"
     elif parsed_url.netloc == 'openrouter.ai':
         engine = "openrouter"
+    elif parsed_url.netloc == 'api.cohere.com':
+        engine = "cohere"
+        request.stream = True
     else:
         engine = "gpt"
 
     if "claude" not in provider['model'][request.model] \
     and "gpt" not in provider['model'][request.model] \
-    and "gemini" not in provider['model'][request.model]:
+    and "gemini" not in provider['model'][request.model] \
+    and parsed_url.netloc != 'api.cloudflare.com' \
+    and parsed_url.netloc != 'api.cohere.com':
         engine = "openrouter"
 
     if "claude" in provider['model'][request.model] and engine == "vertex":
@@ -196,6 +217,11 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
 
     if "gemini" in provider['model'][request.model] and engine == "vertex":
         engine = "vertex-gemini"
+
+    if "o1-preview" in provider['model'][request.model] or "o1-mini" in provider['model'][request.model]:
+        engine = "o1"
+        request.stream = False
+
     if endpoint == "/uni/v1/images/generations":
         engine = "dalle"
         request.stream = False
@@ -206,27 +232,30 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
     logger.info(f"provider: {provider['provider']:<10} model: {request.model:<10} engine: {engine}")
 
     url, headers, payload = await get_payload(request, engine, provider)
-
-    # logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-    # logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
+    if is_debug:
+        logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
+        logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
     try:
         if request.stream:
             model = provider['model'][request.model]
             generator = fetch_response_stream(app.state.client, url, headers, payload, engine, model)
-            wrapped_generator = await error_handling_wrapper(generator, status_code=500)
+            wrapped_generator, first_response_time = await error_handling_wrapper(generator)
             response = StreamingResponse(wrapped_generator, media_type="text/event-stream")
         else:
-            response = await anext(fetch_response(app.state.client, url, headers, payload))
+            generator = fetch_response(app.state.client, url, headers, payload)
+            wrapped_generator, first_response_time = await error_handling_wrapper(generator)
+            first_element = await anext(wrapped_generator)
+            first_element = first_element.lstrip("data: ")
+            first_element = json.loads(first_element)
+            response = JSONResponse(first_element)
 
-        # 更新成功计数
-        async with app.middleware_stack.app.lock:
-            app.middleware_stack.app.channel_success_counts[provider['provider']] += 1
+        # 更新成功计数和首次响应时间
+        await app.middleware_stack.app.update_channel_stats(provider['provider'], request.model, token, success=True, first_response_time=first_response_time)
 
         return response
-    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
-        # 更新失败计数
-        async with app.middleware_stack.app.lock:
-            app.middleware_stack.app.channel_failure_counts[provider['provider']] += 1
+    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+        # 更新失败计数,首次响应时间为-1表示失败
+        await app.middleware_stack.app.update_channel_stats(provider['provider'], request.model, token, success=False, first_response_time=-1)
 
         raise e
 
@@ -269,17 +298,24 @@ class ModelRequestHandler:
 
         for model in config['api_keys'][api_index]['model']:
             if "/" in model:
-                provider_name = model.split("/")[0]
-                model = model.split("/")[1]
-                models_list = []
-                for provider in config['providers']:
-                    if provider['provider'] == provider_name:
-                        models_list.extend(list(provider['model'].keys()))
-                # print("models_list", models_list)
-                # print("model_name", model_name)
-                # print("model", model)
-                if (model and model_name in models_list) or (model == "*" and model_name in models_list):
-                    provider_rules.append(provider_name)
+                if model.startswith("<") and model.endswith(">"):
+                    model = model[1:-1]
+                    # 处理带斜杠的模型名
+                    for provider in config['providers']:
+                        if model in provider['model'].keys():
+                            provider_rules.append(provider['provider'] + "/" + model)
+                else:
+                    provider_name = model.split("/")[0]
+                    model_name_split = "/".join(model.split("/")[1:])
+                    models_list = []
+                    for provider in config['providers']:
+                        if provider['provider'] == provider_name:
+                            models_list.extend(list(provider['model'].keys()))
+                    # print("models_list", models_list)
+                    # print("model_name", model_name)
+                    # print("model", model)
+                    if (model_name_split and model_name in models_list) or (model_name_split == "*" and model_name in models_list):
+                        provider_rules.append(provider_name)
             else:
                 for provider in config['providers']:
                     if model in provider['model'].keys():
@@ -292,7 +328,7 @@ class ModelRequestHandler:
                 # print("provider", provider, provider['provider'] == item, item)
                 if "/" in item:
                     if provider['provider'] == item.split("/")[0]:
-                        if model_name in provider['model'].keys() and item.split("/")[1] == model_name:
+                        if model_name in provider['model'].keys() and "/".join(item.split("/")[1:]) == model_name:
                             provider_list.append(provider)
                 elif provider['provider'] == item:
                     if model_name in provider['model'].keys():
@@ -307,10 +343,10 @@ class ModelRequestHandler:
                 #     else:
                 #         if model_name in provider['model'].keys():
                 #             provider_list.append(provider)
-
-        # import json
-        # for provider in provider_list:
-        #     print(json.dumps(provider, indent=4, ensure_ascii=False))
+        if is_debug:
+            import json
+            for provider in provider_list:
+                print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
     async def request_model(self, request: Union[RequestModel, ImageGenerationRequest], token: str, endpoint=None):
@@ -353,26 +389,38 @@ class ModelRequestHandler:
         if safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY") == False:
             auto_retry = False
 
-        return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint)
+        return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint, token)
 
     # 在 try_all_providers 函数中处理失败的情况
-    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None):
+    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
+        status_code = 500
+        error_message = None
         num_providers = len(providers)
         start_index = self.last_provider_index + 1 if use_round_robin else 0
         for i in range(num_providers + 1):
             self.last_provider_index = (start_index + i) % num_providers
             provider = providers[self.last_provider_index]
             try:
-                response = await process_request(request, provider, endpoint)
+                response = await process_request(request, provider, endpoint, token)
                 return response
-            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError) as e:
+            except HTTPException as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+                status_code = e.status_code
+                error_message = e.detail
+
                 if auto_retry:
                     continue
                 else:
-                    raise HTTPException(status_code=500, detail="Error: Current provider response failed!")
+                    raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
+            except (Exception, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+                error_message = str(e)
+                if auto_retry:
+                    continue
+                else:
+                    raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
 
-        raise HTTPException(status_code=500, detail=f"All providers failed: {request.model}")
+        raise HTTPException(status_code=status_code, detail=f"All {request.model} error: {error_message}")
 
 model_handler = ModelRequestHandler()
 
@@ -417,25 +465,30 @@ class InMemoryRateLimiter:
 
 rate_limiter = InMemoryRateLimiter()
 
-async def get_user_rate_limit(token: str = None):
+async def get_user_rate_limit(api_index: str = None):
     # 这里应该实现根据 token 获取用户速率限制的逻辑
     # 示例： 返回 (次数， 秒数)
     config = app.state.config
-    api_list = app.state.api_list
-    api_index = api_list.index(token)
     raw_rate_limit = safe_get(config, 'api_keys', api_index, "preferences", "RATE_LIMIT")
 
-    if not token or not raw_rate_limit:
-        return (60, 60)
+    if not api_index or not raw_rate_limit:
+        return (30, 60)
 
     rate_limit = parse_rate_limit(raw_rate_limit)
     return rate_limit
 
 security = HTTPBearer()
+
 async def rate_limit_dependency(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials if credentials else None
-    # print("token", token)
-    limit, period = await get_user_rate_limit(token)
+    api_list = app.state.api_list
+    try:
+        api_index = api_list.index(token)
+    except ValueError:
+        print("error: Invalid or missing API Key:", token)
+        api_index = None
+        token = None
+    limit, period = await get_user_rate_limit(api_index)
 
     # 使用 IP 地址和 token（如果有）作为限制键
     client_ip = request.client.host
@@ -464,6 +517,7 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
 
 @app.post("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
 async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
+    # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
 @app.options("/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
@@ -491,23 +545,96 @@ def generate_api_key():
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
+from collections import defaultdict
+from sqlalchemy import func
+
+from collections import defaultdict
+from sqlalchemy import func, desc, case
+
 @app.get("/stats", dependencies=[Depends(rate_limit_dependency)])
 async def get_stats(request: Request, token: str = Depends(verify_admin_api_key)):
-    middleware = app.middleware_stack.app
-    if isinstance(middleware, StatsMiddleware):
-        async with middleware.lock:
-            stats = {
-                "request_counts": dict(middleware.request_counts),
-                "request_times": dict(middleware.request_times),
-                "ip_counts": {k: dict(v) for k, v in middleware.ip_counts.items()},
-                "request_arrivals": {k: [t.isoformat() for t in v] for k, v in middleware.request_arrivals.items()},
-                "channel_success_counts": dict(middleware.channel_success_counts),
-                "channel_failure_counts": dict(middleware.channel_failure_counts),
-                "channel_success_percentages": middleware.calculate_success_percentages(),
-                "channel_failure_percentages": middleware.calculate_failure_percentages()
-            }
-        return JSONResponse(content=stats)
-    return {"error": "StatsMiddleware not found"}
+    async with async_session() as session:
+        # 1. 每个渠道下面每个模型的成功率
+        channel_model_stats = await session.execute(
+            select(
+                ChannelStat.provider,
+                ChannelStat.model,
+                func.count().label('total'),
+                func.sum(case((ChannelStat.success == True, 1), else_=0)).label('success_count')
+            ).group_by(ChannelStat.provider, ChannelStat.model)
+        )
+        channel_model_stats = channel_model_stats.fetchall()
+
+        # 2. 每个渠道总的成功率
+        channel_stats = await session.execute(
+            select(
+                ChannelStat.provider,
+                func.count().label('total'),
+                func.sum(case((ChannelStat.success == True, 1), else_=0)).label('success_count')
+            ).group_by(ChannelStat.provider)
+        )
+        channel_stats = channel_stats.fetchall()
+
+        # 3. 每个模型在所有渠道总的请求次数
+        model_stats = await session.execute(
+            select(ChannelStat.model, func.count().label('count'))
+            .group_by(ChannelStat.model)
+            .order_by(desc('count'))
+        )
+        model_stats = model_stats.fetchall()
+
+        # 4. 每个端点的请求次数
+        endpoint_stats = await session.execute(
+            select(RequestStat.endpoint, func.count().label('count'))
+            .group_by(RequestStat.endpoint)
+            .order_by(desc('count'))
+        )
+        endpoint_stats = endpoint_stats.fetchall()
+
+        # 5. 每个ip请求的次数
+        ip_stats = await session.execute(
+            select(RequestStat.ip, func.count().label('count'))
+            .group_by(RequestStat.ip)
+            .order_by(desc('count'))
+        )
+        ip_stats = ip_stats.fetchall()
+
+    # 处理统计数据并返回
+    stats = {
+        "channel_model_success_rates": [
+            {
+                "provider": stat.provider,
+                "model": stat.model,
+                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0
+            } for stat in sorted(channel_model_stats, key=lambda x: x.success_count / x.total if x.total > 0 else 0, reverse=True)
+        ],
+        "channel_success_rates": [
+            {
+                "provider": stat.provider,
+                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0
+            } for stat in sorted(channel_stats, key=lambda x: x.success_count / x.total if x.total > 0 else 0, reverse=True)
+        ],
+        "model_request_counts": [
+            {
+                "model": stat.model,
+                "count": stat.count
+            } for stat in model_stats
+        ],
+        "endpoint_request_counts": [
+            {
+                "endpoint": stat.endpoint,
+                "count": stat.count
+            } for stat in endpoint_stats
+        ],
+        "ip_request_counts": [
+            {
+                "ip": stat.ip,
+                "count": stat.count
+            } for stat in ip_stats
+        ]
+    }
+
+    return JSONResponse(content=stats)
 
 # async def on_fetch(request, env):
 #     import asgi
@@ -520,6 +647,8 @@ if __name__ == '__main__':
         host="0.0.0.0",
         port=7860,
         reload=True,
+        reload_dirs=["./"],
+        reload_includes=["*.py", "api.yaml"],
         ws="none",
         # log_level="warning"
     )

@@ -5,7 +5,7 @@ from datetime import datetime
 from log_config import logger
 
 
-async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, tokens_use=None, total_tokens=None):
+async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0):
     sample_data = {
         "id": "chatcmpl-9ijPeRHa0wtyA2G8wq5z8FC3wGMzc",
         "object": "chat.completion.chunk",
@@ -29,6 +29,10 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
         # sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"id": tools_id, "name": function_call_name}}]}
     if role:
         sample_data["choices"][0]["delta"] = {"role": role, "content": ""}
+    if total_tokens:
+        total_tokens = prompt_tokens + completion_tokens
+        sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,"total_tokens": total_tokens}
+        sample_data["choices"] = []
     json_data = json.dumps(sample_data, ensure_ascii=False)
 
     # 构建SSE响应
@@ -44,11 +48,11 @@ async def check_response(response, error_log):
             error_json = json.loads(error_str)
         except json.JSONDecodeError:
             error_json = error_str
-        return {"error": f"{error_log} HTTP Error {response.status_code}", "details": error_json}
+        return {"error": f"{error_log} HTTP Error", "status_code": response.status_code, "details": error_json}
     return None
 
 async def fetch_gemini_response_stream(client, url, headers, payload, model):
-    timestamp = datetime.timestamp(datetime.now())
+    timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_gemini_response_stream")
         if error_message:
@@ -68,7 +72,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
                         json_data = json.loads( "{" + line + "}")
                         content = json_data.get('text', '')
                         content = "\n".join(content.split("\\n"))
-                        sse_string = await generate_sse_response(timestamp, model, content)
+                        sse_string = await generate_sse_response(timestamp, model, content=content)
                         yield sse_string
                     except json.JSONDecodeError:
                         logger.error(f"无法解析JSON: {line}")
@@ -93,7 +97,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model):
         yield "data: [DONE]\n\r\n"
 
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model):
-    timestamp = datetime.timestamp(datetime.now())
+    timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_vertex_claude_response_stream")
         if error_message:
@@ -108,13 +112,13 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                logger.info(f"{line}")
+                # logger.info(f"{line}")
                 if line and '\"text\": \"' in line:
                     try:
                         json_data = json.loads( "{" + line + "}")
                         content = json_data.get('text', '')
                         content = "\n".join(content.split("\\n"))
-                        sse_string = await generate_sse_response(timestamp, model, content)
+                        sse_string = await generate_sse_response(timestamp, model, content=content)
                         yield sse_string
                     except json.JSONDecodeError:
                         logger.error(f"无法解析JSON: {line}")
@@ -139,7 +143,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             yield sse_string
         yield "data: [DONE]\n\r\n"
 
-async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects=5):
+async def fetch_gpt_response_stream(client, url, headers, payload):
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_gpt_response_stream")
         if error_message:
@@ -155,14 +159,63 @@ async def fetch_gpt_response_stream(client, url, headers, payload, max_redirects
                 if line and line != "data: " and line != "data:" and not line.startswith(": "):
                     yield line.strip() + "\n\r\n"
 
+async def fetch_cloudflare_response_stream(client, url, headers, payload, model):
+    timestamp = int(datetime.timestamp(datetime.now()))
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        error_message = await check_response(response, "fetch_gpt_response_stream")
+        if error_message:
+            yield error_message
+            return
+
+        buffer = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                # logger.info("line: %s", repr(line))
+                if line.startswith("data:"):
+                    line = line.lstrip("data: ")
+                    if line == "[DONE]":
+                        yield "data: [DONE]\n\r\n"
+                        return
+                    resp: dict = json.loads(line)
+                    message = resp.get("response")
+                    if message:
+                        sse_string = await generate_sse_response(timestamp, model, content=message)
+                        yield sse_string
+
+async def fetch_cohere_response_stream(client, url, headers, payload, model):
+    timestamp = int(datetime.timestamp(datetime.now()))
+    async with client.stream('POST', url, headers=headers, json=payload) as response:
+        error_message = await check_response(response, "fetch_gpt_response_stream")
+        if error_message:
+            yield error_message
+            return
+
+        buffer = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                # logger.info("line: %s", repr(line))
+                resp: dict = json.loads(line)
+                if resp.get("is_finished") == True:
+                    yield "data: [DONE]\n\r\n"
+                    return
+                if resp.get("event_type") == "text-generation":
+                    message = resp.get("text")
+                    sse_string = await generate_sse_response(timestamp, model, content=message)
+                    yield sse_string
+
 async def fetch_claude_response_stream(client, url, headers, payload, model):
-    timestamp = datetime.timestamp(datetime.now())
+    timestamp = int(datetime.timestamp(datetime.now()))
     async with client.stream('POST', url, headers=headers, json=payload) as response:
         error_message = await check_response(response, "fetch_claude_response_stream")
         if error_message:
             yield error_message
             return
         buffer = ""
+        input_tokens = 0
         async for chunk in response.aiter_text():
             # logger.info(f"chunk: {repr(chunk)}")
             buffer += chunk
@@ -171,20 +224,25 @@ async def fetch_claude_response_stream(client, url, headers, payload, model):
                 # logger.info(line)
 
                 if line.startswith("data:"):
-                    line = line[5:]
-                    if line.startswith(" "):
-                        line = line[1:]
+                    line = line.lstrip("data: ")
                     resp: dict = json.loads(line)
                     message = resp.get("message")
                     if message:
-                        tokens_use = resp.get("usage")
                         role = message.get("role")
                         if role:
                             sse_string = await generate_sse_response(timestamp, model, None, None, None, None, role)
                             yield sse_string
+                        tokens_use = message.get("usage")
                         if tokens_use:
-                            total_tokens = tokens_use["input_tokens"] + tokens_use["output_tokens"]
-                            # print("\n\rtotal_tokens", total_tokens)
+                            input_tokens = tokens_use.get("input_tokens", 0)
+                    usage = resp.get("usage")
+                    if usage:
+                        output_tokens = usage.get("output_tokens", 0)
+                        total_tokens = input_tokens + output_tokens
+                        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
+                        yield sse_string
+                        # print("\n\rtotal_tokens", total_tokens)
+
                     tool_use = resp.get("content_block")
                     tools_id = None
                     function_call_name = None
@@ -231,6 +289,12 @@ async def fetch_response_stream(client, url, headers, payload, engine, model):
                 yield chunk
         elif engine == "openrouter":
             async for chunk in fetch_gpt_response_stream(client, url, headers, payload):
+                yield chunk
+        elif engine == "cloudflare":
+            async for chunk in fetch_cloudflare_response_stream(client, url, headers, payload, model):
+                yield chunk
+        elif engine == "cohere":
+            async for chunk in fetch_cohere_response_stream(client, url, headers, payload, model):
                 yield chunk
         else:
             raise ValueError("Unknown response")
