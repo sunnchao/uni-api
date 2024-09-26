@@ -1,11 +1,29 @@
+from io import IOBase
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 
 class ImageGenerationRequest(BaseModel):
     model: str
     prompt: str
     n: int
     size: str
+    stream: bool = False
+
+class AudioTranscriptionRequest(BaseModel):
+    file: Tuple[str, IOBase, str]
+    model: str
+    language: Optional[str] = None
+    prompt: Optional[str] = None
+    response_format: Optional[str] = None
+    temperature: Optional[float] = None
+    stream: bool = False
+
+    class Config:
+        arbitrary_types_allowed = True
+
+class ModerationRequest(BaseModel):
+    input: str
+    model: Optional[str] = "text-moderation-latest"
     stream: bool = False
 
 class FunctionParameter(BaseModel):
@@ -79,3 +97,14 @@ class RequestModel(BaseModel):
     user: Optional[str] = None
     tool_choice: Optional[Union[str, ToolChoice]] = None
     tools: Optional[List[Tool]] = None
+
+    def get_last_text_message(self) -> Optional[str]:
+        for message in reversed(self.messages):
+            if message.content:
+                if isinstance(message.content, str):
+                    return message.content
+                elif isinstance(message.content, list):
+                    for item in reversed(message.content):
+                        if item.type == "text" and item.text:
+                            return item.text
+        return ""

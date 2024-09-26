@@ -30,6 +30,8 @@
 - 支持自动重试，当一个 API 渠道响应失败时，自动重试下一个 API 渠道。
 - 支持细粒度的权限控制。支持使用通配符设置 API key 可用渠道的特定模型。
 - 支持限流，可以设置每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min。
+- 支持多个标准 OpenAI 格式的接口：`/v1/chat/completions`，`/v1/images/generations`，`/v1/audio/transcriptions`，`/v1/moderations`，`/v1/models`。
+- 支持 OpenAI moderation 道德审查，可以对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。降低后台 API 被提供商封禁的风险。
 
 ## Configuration
 
@@ -94,24 +96,26 @@ providers:
     engine: openrouter # 强制使用某个消息格式，目前支持 gpt，claude，gemini，openrouter 原生格式，选填
 
 api_keys:
-  - api: sk-KjjI60Yf0JFWtfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户使用本服务需要 API key，必填
+  - api: sk-KjjI60Yf0JFWxfgRmXqFWyGtWUd9GZnmi3KlvowmRWpWpQRo # API Key，用户使用本服务需要 API key，必填
     model: # 该 API Key 可以使用的模型，必填
       - gpt-4o # 可以使用的模型名称，可以使用所有提供商提供的 gpt-4o 模型
       - claude-3-5-sonnet # 可以使用的模型名称，可以使用所有提供商提供的 claude-3-5-sonnet 模型
       - gemini/* # 可以使用的模型名称，仅可以使用名为 gemini 提供商提供的所有模型，其中 gemini 是 provider 名称，* 代表所有模型
     role: admin
 
-  - api: sk-pkhf60Yf0JGyJygRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
+  - api: sk-pkhf60Yf0JGyJxgRmXqFQyTgWUd9GZnmi3KlvowmRWpWqrhy
     model:
       - anthropic/claude-3-5-sonnet # 可以使用的模型名称，仅可以使用名为 anthropic 提供商提供的 claude-3-5-sonnet 模型。其他提供商的 claude-3-5-sonnet 模型不可以使用。这种写法不会匹配到other-provider提供的名为anthropic/claude-3-5-sonnet的模型。
       - <anthropic/claude-3-5-sonnet> # 通过在模型名两侧加上尖括号，这样就不会去名为anthropic的渠道下去寻找claude-3-5-sonnet模型，而是将整个 anthropic/claude-3-5-sonnet 作为模型名称。这种写法可以匹配到other-provider提供的名为 anthropic/claude-3-5-sonnet 的模型。但不会匹配到anthropic下面的claude-3-5-sonnet模型。
+      - openai-test/text-moderation-latest # 当开启消息道德审查后，可以使用名为 openai-test 渠道下的 text-moderation-latest 模型进行道德审查。
     preferences:
       USE_ROUND_ROBIN: true # 是否使用轮询负载均衡，true 为使用，false 为不使用，默认为 true。开启轮训后每次请求模型按照 model 配置的顺序依次请求。与 providers 里面原始的渠道顺序无关。因此你可以设置每个 API key 请求顺序不一样。
       AUTO_RETRY: true # 是否自动重试，自动重试下一个提供商，true 为自动重试，false 为不自动重试，默认为 true
       RATE_LIMIT: 2/min # 支持限流，每分钟最多请求次数，可以设置为整数，如 2/min，2 次每分钟、5/hour，5 次每小时、10/day，10 次每天，10/month，10 次每月，10/year，10 次每年。默认60/min，选填
+      ENABLE_MODERATION: true # 是否开启消息道德审查，true 为开启，false 为不开启，默认为 false，当开启后，会对用户的消息进行道德审查，如果发现不当的消息，会返回错误信息。
 
   # 渠道级加权负载均衡配置示例
-  - api: sk-KjjI60Yf0JFWtxxxxxxxxxxxxxxwmRWpWpQRo
+  - api: sk-KjjI60Yd0JFWtxxxxxxxxxxxxxxwmRWpWpQRo
     model:
       - gcp1/*: 5 # 冒号后面就是权重，权重仅支持正整数。
       - gcp2/*: 3 # 数字的大小代表权重，数字越大，请求的概率越大。
@@ -135,7 +139,7 @@ Start the container
 docker run --user root -p 8001:8000 --name uni-api -dit \
 -e CONFIG_URL=http://file_url/api.yaml \ # 如果已经挂载了本地配置文件，不需要设置 CONFIG_URL
 -v ./api.yaml:/home/api.yaml \ # 如果已经设置 CONFIG_URL，不需要挂载配置文件
--v ./stats.db:/stats.db \ # 如果不想保存统计数据，不需要挂载 stats.db 文件
+-v ./uniapi_db:/home/data \ # 如果不想保存统计数据，不需要挂载该文件夹
 yym68686/uni-api:latest
 ```
 
@@ -152,7 +156,7 @@ services:
       - 8001:8000
     volumes:
       - ./api.yaml:/home/api.yaml # 如果已经设置 CONFIG_URL，不需要挂载配置文件
-      - ./stats.db:/stats.db # 如果不想保存统计数据，不需要挂载 stats.db 文件
+      - ./uniapi_db:/home/data # 如果不想保存统计数据，不需要挂载该文件夹
 ```
 
 CONFIG_URL 就是可以自动下载远程的配置文件。比如你在某个平台不方便修改配置文件，可以把配置文件传到某个托管服务，可以提供直链给 uni-api 下载，CONFIG_URL 就是这个直链。如果使用本地挂载的配置文件，不需要设置 CONFIG_URL。CONFIG_URL 是在不方便挂载配置文件的情况下使用。
@@ -181,7 +185,7 @@ docker rm -f uni-api
 docker run --user root -p 8001:8000 -dit --name uni-api \
 -e CONFIG_URL=http://file_url/api.yaml \
 -v ./api.yaml:/home/api.yaml \
--v ./stats.db:/stats.db \
+-v ./uniapi_db:/home/data \
 yym68686/uni-api:latest
 docker logs -f uni-api
 ```

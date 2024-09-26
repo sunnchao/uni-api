@@ -308,11 +308,12 @@ class BaseAPI:
             self.chat_url: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/chat/completions",) + ("",) * 3)
         self.image_url: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/images/generations",) + ("",) * 3)
         self.audio_transcriptions: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/audio/transcriptions",) + ("",) * 3)
+        self.moderations: str = urlunparse(parsed_url[:2] + (before_v1 + "/v1/moderations",) + ("",) * 3)
 
-def safe_get(data, *keys):
+def safe_get(data, *keys, default=None):
     for key in keys:
         try:
             data = data[key] if isinstance(data, (dict, list)) else data.get(key)
         except (KeyError, IndexError, AttributeError, TypeError):
-            return None
+            return default
     return data

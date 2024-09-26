@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 
-from models import RequestModel, ImageGenerationRequest
+from models import RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest
 from request import get_payload
 from response import fetch_response, fetch_response_stream
 from utils import error_handling_wrapper, post_all_models, load_config, safe_get, circular_list_encoder
@@ -24,9 +24,49 @@ from urllib.parse import urlparse
 import os
 is_debug = bool(os.getenv("DEBUG", False))
 
+from sqlalchemy import inspect, text
+from sqlalchemy.sql import sqltypes
+
 async def create_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # 检查并添加缺失的列
+        def check_and_add_columns(connection):
+            inspector = inspect(connection)
+            for table in [RequestStat, ChannelStat]:
+                table_name = table.__tablename__
+                existing_columns = {col['name']: col['type'] for col in inspector.get_columns(table_name)}
+
+                for column_name, column in table.__table__.columns.items():
+                    if column_name not in existing_columns:
+                        col_type = _map_sa_type_to_sql_type(column.type)
+                        default = _get_default_sql(column.default)
+                        connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {col_type}{default}"))
+
+        await conn.run_sync(check_and_add_columns)
+
+def _map_sa_type_to_sql_type(sa_type):
+    type_map = {
+        sqltypes.Integer: "INTEGER",
+        sqltypes.String: "TEXT",
+        sqltypes.Float: "REAL",
+        sqltypes.Boolean: "BOOLEAN",
+        sqltypes.DateTime: "DATETIME",
+        sqltypes.Text: "TEXT"
+    }
+    return type_map.get(type(sa_type), "TEXT")
+
+def _get_default_sql(default):
+    if default is None:
+        return ""
+    if isinstance(default.arg, bool):
+        return f" DEFAULT {str(default.arg).upper()}"
+    if isinstance(default.arg, (int, float)):
+        return f" DEFAULT {default.arg}"
+    if isinstance(default.arg, str):
+        return f" DEFAULT '{default.arg}'"
+    return ""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -79,7 +119,7 @@ async def parse_request_body(request: Request):
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, select, Boolean, Text
 from sqlalchemy.sql import func
 
 # 定义数据库模型
@@ -93,6 +133,8 @@ class RequestStat(Base):
     token = Column(String)
     total_time = Column(Float)
     model = Column(String)
+    is_flagged = Column(Boolean, default=False)
+    moderated_content = Column(Text)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 class ChannelStat(Base):
@@ -105,8 +147,16 @@ class ChannelStat(Base):
     first_response_time = Column(Float)  # 新增: 记录首次响应时间
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
+# 获取数据库路径
+db_path = os.getenv('DB_PATH', './data/stats.db')
+
+# 确保 data 目录存在
+data_dir = os.path.dirname(db_path)
+os.makedirs(data_dir, exist_ok=True)
+
 # 创建异步引擎和会话
-engine = create_async_engine('sqlite+aiosqlite:///stats.db', echo=is_debug)
+# engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=False)
+engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 class StatsMiddleware(BaseHTTPMiddleware):
@@ -125,37 +175,76 @@ class StatsMiddleware(BaseHTTPMiddleware):
         start_time = time()
 
         request.state.parsed_body = await parse_request_body(request)
+        endpoint = f"{request.method} {request.url.path}"
+        client_ip = request.client.host
 
         model = "unknown"
+        enable_moderation = False  # 默认不开启道德审查
+        is_flagged = False
+        moderated_content = ""
+
+        config = app.state.config
+        api_list = app.state.api_list
+
+        # 根据token决定是否启用道德审查
+        if token:
+            try:
+                api_index = api_list.index(token)
+                enable_moderation = safe_get(config, 'api_keys', api_index, "preferences", "ENABLE_MODERATION", default=False)
+            except ValueError:
+                # token不在api_list中，使用默认值（不开启）
+                pass
+        else:
+            # 如果token为None，检查全局设置
+            enable_moderation = config.get('ENABLE_MODERATION', False)
+
         if request.state.parsed_body:
             try:
                 request_model = RequestModel(**request.state.parsed_body)
                 model = request_model.model
+                moderated_content = request_model.get_last_text_message()
+
+                if enable_moderation and moderated_content:
+                    moderation_response = await self.moderate_content(moderated_content, token)
+                    moderation_result = moderation_response.body
+                    moderation_data = json.loads(moderation_result)
+                    is_flagged = moderation_data.get('results', [{}])[0].get('flagged', False)
+
+                    if is_flagged:
+                        logger.error(f"Content did not pass the moral check: %s", moderated_content)
+                        process_time = time() - start_time
+                        await self.update_stats(endpoint, process_time, client_ip, model, token, is_flagged, moderated_content)
+                        return JSONResponse(
+                            status_code=400,
+                            content={"error": "Content did not pass the moral check, please modify and try again."}
+                        )
             except RequestValidationError:
                 pass
             except Exception as e:
-                logger.error(f"Error processing request: {str(e)}")
+                if is_debug:
+                    import traceback
+                    traceback.print_exc()
+
+                logger.error(f"处理请求或进行道德检查时出错: {str(e)}")
 
         response = await call_next(request)
         process_time = time() - start_time
 
-        endpoint = f"{request.method} {request.url.path}"
-        client_ip = request.client.host
-
         # 异步更新数据库
-        await self.update_stats(endpoint, process_time, client_ip, model, token)
+        await self.update_stats(endpoint, process_time, client_ip, model, token, is_flagged, moderated_content)
 
         return response
 
-    async def update_stats(self, endpoint, process_time, client_ip, model, token):
+    async def update_stats(self, endpoint, process_time, client_ip, model, token, is_flagged, moderated_content):
         async with self.db as session:
-            # 为每个请求创建一条新的记录
             new_request_stat = RequestStat(
                 endpoint=endpoint,
                 ip=client_ip,
                 token=token,
                 total_time=process_time,
-                model=model
+                model=model,
+                is_flagged=is_flagged,
+                moderated_content=moderated_content
             )
             session.add(new_request_stat)
             await session.commit()
@@ -172,6 +261,14 @@ class StatsMiddleware(BaseHTTPMiddleware):
             session.add(channel_stat)
             await session.commit()
 
+    async def moderate_content(self, content, token):
+        moderation_request = ModerationRequest(input=content)
+
+        # 直接调用 moderations 函数
+        response = await moderations(moderation_request, token)
+
+        return response
+
 # 配置 CORS 中间件
 app.add_middleware(
     CORSMiddleware,
@@ -184,7 +281,7 @@ app.add_middleware(
 app.add_middleware(StatsMiddleware)
 
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest], provider: Dict, endpoint=None, token=None):
+async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], provider: Dict, endpoint=None, token=None):
     url = provider['base_url']
     parsed_url = urlparse(url)
     # print("parsed_url", parsed_url)
@@ -226,6 +323,14 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
         engine = "dalle"
         request.stream = False
 
+    if endpoint == "/uni/v1/audio/transcriptions":
+        engine = "whisper"
+        request.stream = False
+
+    if endpoint == "/uni/v1/moderations":
+        engine = "moderation"
+        request.stream = False
+
     if provider.get("engine"):
         engine = provider["engine"]
 
@@ -234,7 +339,10 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest], 
     url, headers, payload = await get_payload(request, engine, provider)
     if is_debug:
         logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-        logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
+        if payload.get("file"):
+            pass
+        else:
+            logger.info(json.dumps(payload, indent=4, ensure_ascii=False))
     try:
         if request.stream:
             model = provider['model'][request.model]
@@ -349,7 +457,7 @@ class ModelRequestHandler:
                 print(json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
         return provider_list
 
-    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest], token: str, endpoint=None):
+    async def request_model(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str, endpoint=None):
         config = app.state.config
         # api_keys_db = app.state.api_keys_db
         api_list = app.state.api_list
@@ -392,7 +500,7 @@ class ModelRequestHandler:
         return await self.try_all_providers(request, matching_providers, use_round_robin, auto_retry, endpoint, token)
 
     # 在 try_all_providers 函数中处理失败的情况
-    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
+    async def try_all_providers(self, request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], providers: List[Dict], use_round_robin: bool, auto_retry: bool, endpoint: str = None, token: str = None):
         status_code = 500
         error_message = None
         num_providers = len(providers)
@@ -414,6 +522,9 @@ class ModelRequestHandler:
                     raise HTTPException(status_code=500, detail=f"Error: Current provider response failed: {error_message}")
             except (Exception, asyncio.CancelledError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                 logger.error(f"Error with provider {provider['provider']}: {str(e)}")
+                if is_debug:
+                    import traceback
+                    traceback.print_exc()
                 error_message = str(e)
                 if auto_retry:
                     continue
@@ -516,7 +627,7 @@ def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     return token
 
 @app.post("/uni/v1/chat/completions", dependencies=[Depends(rate_limit_dependency)])
-async def request_model(request: Union[RequestModel, ImageGenerationRequest], token: str = Depends(verify_api_key)):
+async def request_model(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest], token: str = Depends(verify_api_key)):
     # logger.info(f"Request received: {request}")
     return await model_handler.request_model(request, token)
 
@@ -539,15 +650,47 @@ async def images_generations(
 ):
     return await model_handler.request_model(request, token, endpoint="/uni/v1/images/generations")
 
-@app.get("/uni/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
+@app.post("/uni/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
+async def moderations(
+    request: ModerationRequest,
+    token: str = Depends(verify_api_key)
+):
+    return await model_handler.request_model(request, token, endpoint="/uni/v1/moderations")
+
+from fastapi import UploadFile, File, Form, HTTPException
+import io
+@app.post("/uni/v1/audio/transcriptions", dependencies=[Depends(rate_limit_dependency)])
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    token: str = Depends(verify_api_key)
+):
+    try:
+        # 读取上传的文件内容
+        content = await file.read()
+        file_obj = io.BytesIO(content)
+
+        # 创建AudioTranscriptionRequest对象
+        request = AudioTranscriptionRequest(
+            file=(file.filename, file_obj, file.content_type),
+            model=model
+        )
+
+        return await model_handler.request_model(request, token, endpoint="/v1/audio/transcriptions")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid audio file encoding")
+    except Exception as e:
+        if is_debug:
+            import traceback
+            traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error processing audio file: {str(e)}")
+
+@app.get("/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
 def generate_api_key():
     api_key = "sk-" + secrets.token_urlsafe(36)
     return JSONResponse(content={"api_key": api_key})
 
 # 在 /stats 路由中返回成功和失败百分比
-from collections import defaultdict
-from sqlalchemy import func
-
 from collections import defaultdict
 from sqlalchemy import func, desc, case
 
